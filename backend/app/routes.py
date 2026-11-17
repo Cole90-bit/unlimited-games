@@ -37,7 +37,8 @@ def get_game(game_id):
 
 @api.post("/games/<int:game_id>/moves")
 def move(game_id):
-    return jsonify(game_service.record_move(game_id, body())), 201
+    result = game_service.record_move(game_id, body())
+    return jsonify(result), 201 if result["ruling"]["accepted"] else 200
 
 
 @api.post("/ideas/draft")
@@ -80,3 +81,33 @@ def update_game(game_id):
 def delete_game(game_id):
     game_service.delete_game(game_id)
     return jsonify(deleted=True)
+
+
+@api.get("/games/<int:game_id>/scene")
+def get_scene(game_id):
+    from .scene_service import current_scene
+    return jsonify(scene=current_scene(game_id))
+
+
+@api.post("/games/<int:game_id>/scene")
+def update_scene(game_id):
+    from .scene_service import update_scene
+    return jsonify(scene=update_scene(game_id))
+
+
+@api.get("/games/<int:game_id>/scenes")
+def get_scenes(game_id):
+    from .scene_service import scene_history
+    return jsonify(scenes=scene_history(game_id))
+
+
+@api.get("/games/<int:game_id>/scene-images/<int:image_id>")
+def get_scene_image(game_id, image_id):
+    import base64
+    from flask import Response
+    from werkzeug.exceptions import NotFound
+    row = get_db().execute("SELECT image_data FROM scene_images WHERE id = ? AND game_id = ?", (image_id, game_id)).fetchone()
+    if not row:
+        raise NotFound("Scene image not found.")
+    header, data = row["image_data"].split(",", 1)
+    return Response(base64.b64decode(data), mimetype=header[5:].split(";")[0])

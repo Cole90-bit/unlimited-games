@@ -3,6 +3,8 @@ let activeGame = null;
 let busy = false;
 let draft = null;
 let savedIdeaId = null;
+let sceneGeneration = null;
+let sceneRequest = 0;
 
 async function api(path, data, method = "POST") {
   const response = await fetch(`/api${path}`, data === undefined && method === "POST" ? {} : {
@@ -28,7 +30,63 @@ async function perform(task) {
   }
 }
 
+function showSceneHistory(gameId, scenes) {
+  if (!activeGame || activeGame.id !== gameId) return;
+  for (const scene of scenes) {
+    const url = `/api/games/${gameId}/scene-images/${scene.image_id}`;
+    if (scene.turn_number > 0) {
+      const image = document.querySelector(`#moves img[data-turn="${scene.turn_number}"]`);
+      if (image) { image.src = url; image.alt = scene.description; image.hidden = false; }
+    }
+  }
+  const current = scenes[scenes.length - 1];
+  if (current) {
+    $("scene-image").src = `/api/games/${gameId}/scene-images/${current.image_id}`;
+    $("scene-image").alt = current.description;
+    $("scene-image").hidden = false;
+  }
+}
+
+async function refreshScene(gameId) {
+  const requestId = ++sceneRequest;
+  const visible = () => activeGame && activeGame.id === gameId && requestId === sceneRequest;
+  try {
+    if (sceneGeneration) await sceneGeneration.catch(() => {});
+    while (visible()) {
+      const existing = await api(`/games/${gameId}/scenes`);
+      if (!visible()) return;
+      showSceneHistory(gameId, existing.scenes);
+      const turns = new Set(existing.scenes.map((scene) => scene.turn_number));
+      if (Array.from({length: activeGame.moves.length + 1}, (_, n) => n).every((n) => turns.has(n))) {
+        $("scene-status").textContent = "";
+        $("scene-retry").hidden = true;
+        return;
+      }
+      $("scene-status").textContent = "Creating scene images...";
+      $("scene-retry").hidden = true;
+      const generation = api(`/games/${gameId}/scene`, {});
+      sceneGeneration = generation;
+      try { await generation; }
+      finally { if (sceneGeneration === generation) sceneGeneration = null; }
+    }
+  } catch (error) {
+    if (!visible()) return;
+    $("scene-status").textContent = error.message;
+    $("scene-retry").hidden = false;
+  }
+}
+
+$("scene-retry").addEventListener("click", () => {
+  if (activeGame) refreshScene(activeGame.id);
+});
+
 function renderGame(game) {
+  const changedGame = !activeGame || activeGame.id !== game.id;
+  if (changedGame) {
+    $("scene-image").hidden = true;
+    $("scene-image").removeAttribute("src");
+    $("scene-status").textContent = "";
+  }
   activeGame = game;
   $("review").hidden = true;
   $("empty").hidden = true;
@@ -50,10 +108,28 @@ function renderGame(game) {
     text.className = "preserve";
     text.textContent = move.action;
     item.append(heading, text);
+    const sceneImage = document.createElement("img");
+    sceneImage.className = "turn-scene";
+    sceneImage.dataset.turn = String(move.turn_number);
+    sceneImage.hidden = true;
+    item.append(sceneImage);
+    if (move.referee_response) {
+      const response = document.createElement("p");
+      response.className = "preserve";
+      response.textContent = "Game: " + move.referee_response;
+      item.append(response);
+    }
+    if (move.referee_explanation) {
+      const ruling = document.createElement("p");
+      ruling.className = "preserve";
+      ruling.textContent = "Referee: " + move.referee_explanation + "\nState: " + move.referee_state;
+      item.append(ruling);
+    }
     return item;
   }));
-  // The player remains manually selectable; this starter imposes no turn rules.
+
   localStorage.setItem("activeGameId", String(game.id));
+  refreshScene(game.id);
 }
 
 async function loadGames() {
@@ -193,7 +269,8 @@ $("create-form").addEventListener("submit", (event) => {
   perform(async () => {
     $("message").textContent = "Developing your game idea…";
     const result = await api("/ideas/draft", {
-      prompt: $("prompt").value, genre: $("genre").value, complexity: $("complexity").value,
+      timeframe: $("timeframe").value, location: $("location").value,
+      details: $("details").value, complexity: $("complexity").value,
     });
     renderIdea(result.idea);
     $("revision").value = "";
@@ -234,11 +311,14 @@ $("move-form").addEventListener("submit", (event) => {
   event.preventDefault();
   perform(async () => {
     const player = $("player").value;
-    renderGame(await api(`/games/${activeGame.id}/moves`, {
+    $("message").textContent = "The referee is reviewing your move?";
+    const result = await api(`/games/${activeGame.id}/moves`, {
       player, action: $("action").value,
-    }));
+    });
+    renderGame(result.game);
     $("player").value = player;
-    $("action").value = "";
+    $("message").textContent = result.ruling.accepted ? "Move accepted." : `Move rejected: ${result.ruling.response} (${result.ruling.explanation})`;
+    if (result.ruling.accepted) $("action").value = "";
   });
 });
 

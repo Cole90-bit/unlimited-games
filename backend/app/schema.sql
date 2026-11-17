@@ -26,3 +26,23 @@ CREATE TABLE IF NOT EXISTS idea_instances (
     game_id INTEGER PRIMARY KEY REFERENCES games(id),
     idea_id INTEGER NOT NULL REFERENCES ideas(id)
 );
+
+CREATE TABLE IF NOT EXISTS scenes (
+    game_id INTEGER PRIMARY KEY REFERENCES games(id),
+    description TEXT NOT NULL,
+    image_data TEXT NOT NULL,
+    turn_number INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS scene_images (
+    id INTEGER PRIMARY KEY,
+    game_id INTEGER NOT NULL REFERENCES games(id),
+    description TEXT NOT NULL,
+    image_data TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS scene_turns (
+    game_id INTEGER NOT NULL REFERENCES games(id),
+    turn_number INTEGER NOT NULL,
+    image_id INTEGER NOT NULL REFERENCES scene_images(id),
+    PRIMARY KEY (game_id, turn_number)
+);

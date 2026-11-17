@@ -19,6 +19,8 @@ class AppTest(unittest.TestCase):
         self.path = Path(self.directory.name) / "games.db"
         self.app = create_app(self.path)
         self.client = self.app.test_client()
+        self.narrator = patch("app.ai_client.narrate_move", return_value="The door opens.").start()
+        self.referee = patch("app.ai_client.referee_move", return_value={"accepted": True, "response": "The door opens.", "explanation": "Allowed", "state": "Play continues"}).start()
 
     def tearDown(self):
         self.directory.cleanup()
@@ -57,7 +59,111 @@ class AppTest(unittest.TestCase):
             self.assertEqual(self.client.post(url, json=payload).status_code, 400)
         self.assertEqual(self.client.get(f"/api/games/{game['id']}").json["moves"], [])
         valid = self.client.post(url, json={"player": "Ada", "action": "Move"})
-        self.assertEqual(valid.json["moves"][0]["turn_number"], 1)
+        self.assertEqual(valid.json["game"]["moves"][0]["turn_number"], 1)
+
+    def test_referee_rejection_failure_and_persistence(self):
+        game = self.create_game()
+        url = f"/api/games/{game['id']}/moves"
+        self.referee.return_value = {"accepted": False, "response": "Wait for your turn.", "explanation": "Not your turn", "state": "Unchanged"}
+        response = self.client.post(url, json={"player": "Ada", "action": "Move"})
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json["ruling"]["accepted"])
+        self.assertEqual(response.json["game"]["moves"], [])
+        self.referee.return_value = {"accepted": True, "response": "The door opens.", "explanation": "Allowed", "state": "Ada moved"}
+        response = self.client.post(url, json={"player": "Ada", "action": "Move"})
+        self.assertEqual(response.status_code, 201)
+        saved = create_app(self.path).test_client().get(f"/api/games/{game['id']}").json
+        self.assertEqual(saved["moves"][0]["referee_response"], "The door opens.")
+        self.assertEqual(saved["moves"][0]["referee_state"], "Ada moved")
+        self.assertEqual(saved["moves"][0]["referee_explanation"], "Allowed")
+
+    @patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"})
+    @patch("app.ai_client.urlopen")
+    def test_referee_response_validation(self, urlopen):
+        self.referee.stop()
+        self.narrator.stop()
+        provider = MagicMock()
+        urlopen.return_value.__enter__.return_value = provider
+        ruling = {"accepted": True, "response": "A door opens.", "explanation": "Allowed", "state": "Door open"}
+        def set_response(value):
+            provider.read.return_value = json.dumps({"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(value)}}]})
+        game = self.create_game()
+        url = f"/api/games/{game['id']}/moves"
+        provider.read.side_effect = [json.dumps({"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(ruling)}}]}),
+                                     json.dumps({"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"response": "A door opens."})}}]})]
+        result = self.client.post(url, json={"player": "Ada", "action": "Open door"})
+        self.assertEqual(result.status_code, 201)
+        self.assertEqual(result.json["game"]["moves"][0]["referee_response"], "A door opens.")
+        provider.read.side_effect = [json.dumps({"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(ruling)}}]}),
+                                     json.dumps({"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"response": ""})}}]})]
+        self.assertEqual(self.client.post(url, json={"player": "Lin", "action": "Enter"}).status_code, 502)
+        self.assertEqual(len(self.client.get(f"/api/games/{game['id']}").json["moves"]), 1)
+
+    def test_stale_referee_result_is_not_saved(self):
+        game = self.create_game()
+        url = f"/api/games/{game['id']}"
+        def edit_during_review(*args):
+            other = self.app.test_client()
+            other.put(url, json={"title": "Changed", "rules": "New rules", "players": ["Ada", "Lin"]})
+            return {"accepted": True, "response": "The door opens.", "explanation": "Allowed", "state": "Moved"}
+        self.referee.side_effect = edit_during_review
+        response = self.client.post(url + "/moves", json={"player": "Ada", "action": "Move"})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(self.client.get(url).json["moves"], [])
+
+    @patch.dict("os.environ", {"FAL_KEY": "test-key"})
+    @patch("app.scene_service.describe_scene")
+    def test_scene_persists_and_reuses_unchanged_image(self, describe):
+        import sys
+        game = self.create_game()
+        url = f"/api/games/{game['id']}/scene"
+        fal = MagicMock()
+        fal.subscribe.return_value = {"images": [{"url": "data:image/jpeg;base64,YWJj"}]}
+        describe.return_value = {"changed": True, "description": "A detective in a hall"}
+        with patch.dict(sys.modules, {"fal_client": fal}):
+            first = self.client.post(url)
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(first.json["scene"]["description"], "A detective in a hall")
+            self.client.post(f"/api/games/{game['id']}/moves", json={"player": "Ada", "action": "Ask a question"})
+            describe.return_value = {"changed": False, "description": "Same hall"}
+            second = self.client.post(url)
+            self.assertEqual(second.status_code, 200)
+            self.assertEqual(second.json["scene"]["image_data"], first.json["scene"]["image_data"])
+            self.assertEqual(second.json["scene"]["turn_number"], 1)
+            self.assertEqual(fal.subscribe.call_count, 1)
+            history = self.client.get(url + "s").json["scenes"]
+            self.assertEqual([item["turn_number"] for item in history], [0, 1])
+            self.assertEqual(history[0]["image_id"], history[1]["image_id"])
+            image = self.client.get(f"/api/games/{game['id']}/scene-images/{history[1]['image_id']}")
+            self.assertEqual(image.data, b"abc")
+            restarted = create_app(self.path).test_client()
+            self.assertEqual(restarted.get(url + "s").json["scenes"], history)
+            self.assertEqual(self.client.delete(f"/api/games/{game['id']}").status_code, 200)
+
+    @patch.dict("os.environ", {"FAL_KEY": "test-key"})
+    @patch("app.scene_service.describe_scene")
+    def test_history_generates_old_turns_without_future_moves(self, describe):
+        import sys
+        game = self.create_game()
+        move_url = f"/api/games/{game['id']}/moves"
+        self.client.post(move_url, json={"player": "Ada", "action": "Open door"})
+        self.client.post(move_url, json={"player": "Lin", "action": "Enter"})
+        describe.return_value = {"changed": True, "description": "A scene"}
+        fal = MagicMock()
+        fal.subscribe.return_value = {"images": [{"url": "data:image/jpeg;base64,YWJj"}]}
+        with patch.dict(sys.modules, {"fal_client": fal}):
+            for turn in range(3):
+                self.assertEqual(self.client.post(f"/api/games/{game['id']}/scene").status_code, 200)
+                self.assertEqual(len(describe.call_args.args[0]["moves"]), turn)
+            history = self.client.get(f"/api/games/{game['id']}/scenes").json["scenes"]
+            self.assertEqual([item["turn_number"] for item in history], [0, 1, 2])
+            self.assertEqual(len({item["image_id"] for item in history}), 3)
+
+    @patch.dict("os.environ", {"FAL_KEY": ""})
+    def test_missing_image_key_does_not_prevent_moves(self):
+        game = self.create_game()
+        self.assertEqual(self.client.post(f"/api/games/{game['id']}/scene").status_code, 503)
+        self.assertEqual(self.client.post(f"/api/games/{game['id']}/moves", json={"player": "Ada", "action": "Look around"}).status_code, 201)
 
     def test_validation_and_missing_game(self):
         for payload in [[], {}, {"title": "X", "rules": "Y", "players": ["Ada", " Ada "]}]:
@@ -81,10 +187,29 @@ class AppTest(unittest.TestCase):
         self.assertEqual(response.json["idea"], revised)
         self.assertEqual(generate.call_args.args[0]["current_idea"], original)
         self.assertEqual(generate.call_args.args[0]["request"], "Make it cooperative")
+        self.assertEqual(generate.call_args.args[0]["genre"], "Mystery")
+        self.client.post("/api/ideas/draft", json={"prompt": "A game", "genre": "Strategy"})
+        self.assertEqual(generate.call_args.args[0]["genre"], "Mystery")
         saved = self.client.post("/api/ideas", json={"idea": revised})
         self.assertEqual(saved.status_code, 201)
         restarted = create_app(self.path).test_client()
         self.assertEqual(restarted.get("/api/ideas").json["ideas"][0]["idea"], revised)
+
+    @patch("app.ai_client.generate_idea")
+    def test_mystery_setting_fields(self, generate):
+        generate.return_value = self.idea()
+        url = "/api/ideas/draft"
+        response = self.client.post(url, json={"timeframe": " 1920s ", "location": " Chicago ",
+                                               "details": " A winter storm ", "complexity": "Simple"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(generate.call_args.args[0], {"genre": "Mystery", "timeframe": "1920s",
+                         "location": "Chicago", "additional_details": "A winter storm", "complexity": "Simple"})
+        response = self.client.post(url, json={"timeframe": "Present", "location": "London", "details": " "})
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("additional_details", generate.call_args.args[0])
+        for body in ({"timeframe": "", "location": "London"}, {"timeframe": "Present"},
+                     {"timeframe": "Present", "location": "London", "details": []}):
+            self.assertEqual(self.client.post(url, json=body).status_code, 400)
 
     def test_independent_instances_and_invalid_players(self):
         saved = self.client.post("/api/ideas", json={"idea": self.idea()}).json

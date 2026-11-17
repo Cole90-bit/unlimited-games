@@ -1,7 +1,7 @@
 """Database operations. Game-specific rule enforcement can be added here."""
 import json
 
-from werkzeug.exceptions import BadRequest, NotFound
+from werkzeug.exceptions import BadRequest, NotFound, Conflict
 
 from .db import get_db
 
@@ -59,20 +59,24 @@ def create_game(data, commit=True):
 def record_move(game_id, data):
     player = require_text(data.get("player"), "Player", 80)
     action = require_text(data.get("action"), "Action", 5000)
+    from .ai_client import referee_move, narrate_move
+    game = get_game(game_id)
+    if player not in game["players"]:
+        raise BadRequest("Player must belong to this game.")
+    ruling = referee_move(game, player, action)
+    ruling["response"] = narrate_move(game, player, action, ruling)
     connection = get_db()
-    # Lock before assigning a turn number, so simultaneous submissions cannot
-    # receive the same number. AI calls should happen outside this transaction.
     with connection:
         connection.execute("BEGIN IMMEDIATE")
-        game = get_game(game_id)
-        if player not in game["players"]:
-            raise BadRequest("Player must belong to this game.")
-        turn = len(game["moves"]) + 1
-        connection.execute(
-            "INSERT INTO moves (game_id, turn_number, player, action) VALUES (?, ?, ?, ?)",
-            (game_id, turn, player, action),
-        )
-    return get_game(game_id)
+        current = get_game(game_id)
+        if current != game:
+            raise Conflict("The game changed while the move was being reviewed. Please submit it again.")
+        if ruling["accepted"]:
+            connection.execute(
+                "INSERT INTO moves (game_id, turn_number, player, action, referee_explanation, referee_state, referee_response) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (game_id, len(game["moves"]) + 1, player, action, ruling["explanation"], ruling["state"], ruling["response"]),
+            )
+    return {"game": get_game(game_id), "ruling": ruling}
 
 
 def validate_idea(data):
@@ -85,11 +89,20 @@ def validate_idea(data):
 
 def draft_idea(data):
     from .ai_client import generate_idea
-    prompt = require_text(data.get("prompt"), "Game idea or revision", 5000)
-    context = {"request": prompt}
+    context = {"genre": "Mystery"}
+    if "timeframe" in data or "location" in data:
+        context["timeframe"] = require_text(data.get("timeframe"), "Timeframe", 120)
+        context["location"] = require_text(data.get("location"), "Location", 200)
+        details = data.get("details", "")
+        if not isinstance(details, str) or len(details) > 5000:
+            raise BadRequest("Additional details must be text, at most 5000 characters.")
+        if details.strip():
+            context["additional_details"] = details.strip()
+    else:
+        context["request"] = require_text(data.get("prompt"), "Game idea or revision", 5000)
     if data.get("idea") is not None:
         context["current_idea"] = validate_idea(data["idea"])
-    for field in ("genre", "complexity"):
+    for field in ("complexity",):
         value = data.get(field)
         if value:
             context[field] = require_text(value, field, 80)
@@ -154,6 +167,7 @@ def update_game(game_id, data):
             raise BadRequest("Keep players who have recorded moves so history remains consistent.")
         connection.execute("UPDATE games SET title = ?, rules = ?, players_json = ? WHERE id = ?",
                            (title, rules, json.dumps(players), game_id))
+        connection.execute("UPDATE scenes SET turn_number = -1 WHERE game_id = ?", (game_id,))
     return get_game(game_id)
 
 
@@ -161,6 +175,9 @@ def delete_game(game_id):
     connection = get_db()
     with connection:
         get_game(game_id)
+        connection.execute("DELETE FROM scene_turns WHERE game_id = ?", (game_id,))
+        connection.execute("DELETE FROM scene_images WHERE game_id = ?", (game_id,))
+        connection.execute("DELETE FROM scenes WHERE game_id = ?", (game_id,))
         connection.execute("DELETE FROM moves WHERE game_id = ?", (game_id,))
         connection.execute("DELETE FROM idea_instances WHERE game_id = ?", (game_id,))
-        connection.execute("DELETE FROM games WHERE id = ?", (game_id,))
+        connection.execute("DELETE FROM games WHERE id = ?", (game_id,))
